@@ -67,3 +67,7 @@ cd C:/Users/tr/.dsh/profiles/watch && pnpm exec dsh --profile watch --dump-confi
 \`\`\`
 
 实测记录（2026-08-16）：哨兵触发 → 预检 PASS → 接管旧 web（36608）→ spawn 新 web → 唤醒目标会话 → 清哨兵，全链路已验证。
+
+## License
+
+MIT
