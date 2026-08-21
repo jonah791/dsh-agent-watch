@@ -298,7 +298,7 @@ export function apply(ctx: Context, config: Config): void {
     // ③ 试运行目标 profile @随机端口，存活 preflightReadyMs 即 PASS
     return new Promise((resolvePromise) => {
       logger.info('[预检] 试运行 profile "' + config.profile + '" @ ' + workspace + ' ...')
-      const child = spawn(process.execPath, ['--expose-internals', bin, '--profile', config.profile, '--port', '0'], { cwd: workspace })
+      const child = spawn(process.execPath, ['--expose-internals', bin, '--profile', config.profile, '--port', '0', '--no-open'], { cwd: workspace })
       let out = ''
       child.stdout.on('data', (d: Buffer) => { out += d })
       child.stderr.on('data', (d: Buffer) => { out += d })
@@ -435,7 +435,7 @@ export function apply(ctx: Context, config: Config): void {
           await waitPortFree()
           if (state.manualStop) return
         }
-        const cmd = config.launchCmd.length > 0 ? config.launchCmd : [process.execPath, '--expose-internals', bin, '--profile', config.profile]
+        const cmd = config.launchCmd.length > 0 ? config.launchCmd : [process.execPath, '--expose-internals', bin, '--profile', config.profile, '--no-open']
         logger.info('启动 web: ' + cmd.join(' ') + '（cwd=' + workspace + '）...')
         let child: ChildProcess
         try {
@@ -502,14 +502,25 @@ export function apply(ctx: Context, config: Config): void {
     })()
   }
 
+  /**
+   * 向会话投递一条消息（唤醒/通知）。
+   *
+   * 2026-08-19 修复：mode 用 'steer' 而非 'queue'——
+   * agent-loop 边界行为：queue（next-turn）消息在 agent running 时入队，
+   * wakeRequested 不 latch（仅 maintenance/abort 后 latch），轮次结束不补醒，
+   * 消息永远躺着（实测：通知/探针躺 inbox 直到外部事件）。
+   * steer（next-step）在 idle=开新轮 / running=下一步边界消费 / aborted=转 next-turn+latch，
+   * 三种状态都可靠投递。
+   * 重试 5 次 × 3s：覆盖 web 热重载窗口（cordis HMR 探针期间 API 短暂不可用，实测 09:44-09:45）。
+   */
   const sendPrompt = async (sessionId: string, text: string): Promise<boolean> => {
     const body = JSON.stringify({
       type: 'client-request',
       rpcId: 'dsh-watch-' + Date.now(),
       method: 'session.prompt',
-      payload: { sessionId, mode: 'queue', content: [{ type: 'text', text }] },
+      payload: { sessionId, mode: 'steer', content: [{ type: 'text', text }] },
     })
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
       try {
         const res = await fetch(config.baseUrl + '/api/session.prompt', {
           method: 'POST',
@@ -521,11 +532,15 @@ export function apply(ctx: Context, config: Config): void {
           logger.info('已发送消息到会话 ' + sessionId)
           return true
         }
-        logger.warn('发送重试 ' + String(attempt) + ': ' + JSON.stringify(data?.result?.error ?? data).slice(0, 160))
+        const reason = 'HTTP ' + res.status + ' ' + JSON.stringify(data?.result?.error ?? data).slice(0, 160)
+        logger.warn('发送重试 ' + String(attempt) + ': ' + reason)
+        logEvent('通知重试 ' + String(attempt) + ' 失败: ' + reason)
       } catch (err) {
-        logger.warn('发送失败（重试 ' + String(attempt) + '）: ' + String(err))
+        const reason = String(err)
+        logger.warn('发送失败（重试 ' + String(attempt) + '）: ' + reason)
+        logEvent('通知重试 ' + String(attempt) + ' 异常: ' + reason)
       }
-      await sleep(1500)
+      await sleep(3000)
     }
     return false
   }
@@ -551,15 +566,19 @@ export function apply(ctx: Context, config: Config): void {
     return false
   }
 
-  // 重启后统一唤醒决策：显式 id 优先，否则最近活跃会话
+  // 重启后统一唤醒决策：显式 id 优先但必须先验证真实存在（哨兵可能携带过期/失效会话，
+  // 如旧版绑定 mainSessionId 残留）；失效则自动回退最近活跃会话——不绑定、永远追踪最新
   const decideAndWake = async (explicitId?: string) => {
     if (!(await waitWebReady(config.readyTimeoutMs))) {
       logger.error('web 未在时限内就绪，跳过唤醒')
       logEvent('web 未在时限内真正就绪（API 探测失败），跳过唤醒')
       return
     }
-    let sid = explicitId
-    if (!sid) sid = findActiveSession(await listSessions())?.sessionId
+    const sessions = await listSessions()
+    let sid = explicitId !== undefined && sessions.some((s) => s.sessionId === explicitId) ? explicitId : undefined
+    logEvent('唤醒决策: explicit=' + String(explicitId ?? '无') + ' 列表=' + sessions.map((s) => s.sessionId).join(',') + ' → 初选=' + String(sid ?? '待回退'))
+    if (!sid) sid = findActiveSession(sessions)?.sessionId
+    logEvent('唤醒目标: ' + String(sid ?? '无（跳过）'))
     if (sid) {
       const sent = await wakeSession(sid)
       logEvent(sent ? '唤醒消息已发送: ' + sid : '唤醒消息发送失败: ' + sid)
@@ -642,15 +661,21 @@ export function apply(ctx: Context, config: Config): void {
       if (!pass) {
         writeIncident({ message: 'preflight failed; web kept running', flag: flagPath, workspace, detail: pf.output.slice(-1500) })
         // 失败反馈闭环：主动通知目标会话，让 agent 知晓（不删哨兵，修复后 touch 重试）
+        // 通知结果回写 incident（agent 查事故文件即见完整闭环，2026-08-19）
         let notifySid = info.sessionId
         if (!notifySid) notifySid = findActiveSession(await listSessions())?.sessionId
+        let notified = false
+        let notifyError = ''
         if (notifySid) {
           const reason = pf.output.split(/\r?\n/).filter((l) => /Error|error|failed|FAIL/.test(l)).slice(-6).join('\n') || pf.output.slice(-400)
-          const sent = await sendPrompt(notifySid, '[守护] 哨兵触发失败：预检 FAIL（组合无法加载），web 未重启（免疫层拦截，旧 web 不受影响）。\n原因：' + reason.slice(0, 600) + '\n哨兵已保留，修复后 touch ' + flagPath + ' 重试。')
-          logEvent(sent ? '已通知会话 ' + notifySid : '通知发送失败')
+          notified = await sendPrompt(notifySid, '[守护] 哨兵触发失败：预检 FAIL（组合无法加载），web 未重启（免疫层拦截，旧 web 不受影响）。\n原因：' + reason.slice(0, 600) + '\n哨兵已保留，修复后 touch ' + flagPath + ' 重试。')
+          notifyError = notified ? '' : 'sendPrompt 全部重试失败（详见 .watch-events.log）'
+          logEvent(notified ? '已通知会话 ' + notifySid : '通知发送失败（见 events 详情）')
         } else {
+          notifyError = '无目标会话可通知'
           logEvent('无目标会话可通知（失败反馈未送达）')
         }
+        writeIncident({ message: 'preflight failed; web kept running', flag: flagPath, workspace, detail: pf.output.slice(-1500), notified, notifyError, notifySid })
         return // 哨兵保留，修复后 touch 重试
       }
       logger.info('预检通过，重启 web...')
