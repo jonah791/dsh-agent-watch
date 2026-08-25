@@ -62,6 +62,12 @@ export interface Config {
   launchCmd: string[]
   /** 启动时端口被外部 dsh web 占用 → 收养托管（不重复拉起，零互踢）。 */
   adoptExternal: boolean
+  /** Telegram 通知 bot token（可选；配置后 web 重启/拉起时推送给主人）。 */
+  telegramBotToken: string
+  /** Telegram 通知目标 chat id（可选；配合 botToken 使用）。 */
+  telegramChatId: string
+  /** Telegram 通知代理（clash 等；Telegram 被墙需代理，默认 127.0.0.1:16888）。 */
+  httpProxy: string
 }
 
 export const Config = z.object({
@@ -82,6 +88,9 @@ export const Config = z.object({
   debounceMs: z.number().default(300),
   launchCmd: z.array(z.string()).default([]),
   adoptExternal: z.boolean().default(true),
+  telegramBotToken: z.string().default(''),
+  telegramChatId: z.string().default(''),
+  httpProxy: z.string().default('http://127.0.0.1:16888'),
 })
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
@@ -503,6 +512,42 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
+   * Telegram 通知（2026-08-25）：watch 独立发通知，不依赖 web 的 telegram 插件。
+   * 用 spawn curl + -x 代理（Telegram 被墙需走 clash 代理；Node fetch 无代理 env 会超时，
+   * node:undici 不可用）。参数数组方式传给 curl，无 shell 转义坑。配置了 botToken+chatId 才启用。
+   */
+  const sendTelegram = async (text: string): Promise<boolean> => {
+    const token = config.telegramBotToken
+    const chat = config.telegramChatId
+    if (!token || !chat) return false
+    const body = JSON.stringify({ chat_id: Number(chat), text, disable_notification: false })
+    return new Promise<boolean>((resolvePromise) => {
+      const child = spawn('curl.exe', [
+        '-s', '--max-time', '15',
+        '-x', config.httpProxy || 'http://127.0.0.1:16888',
+        '-H', 'Content-Type: application/json',
+        '-d', body,
+        `https://api.telegram.org/bot${token}/sendMessage`,
+      ], { windowsHide: true })
+      let out = ''
+      child.stdout?.on('data', (d: Buffer) => { out += d.toString() })
+      child.stderr?.on('data', (d: Buffer) => { out += d.toString() })
+      child.on('error', (err) => { logEvent('Telegram 通知 spawn 异常: ' + String(err).slice(0, 200)); resolvePromise(false) })
+      child.on('close', (code) => {
+        try {
+          const data = JSON.parse(out) as { ok?: boolean; description?: string }
+          if (data.ok === true) { logEvent('Telegram 通知已发送'); resolvePromise(true); return }
+          logEvent('Telegram 通知失败: ' + String(code) + ' ' + (data.description ?? out.slice(0, 200)))
+          resolvePromise(false)
+        } catch {
+          logEvent('Telegram 通知解析失败: ' + String(code) + ' ' + out.slice(0, 200))
+          resolvePromise(false)
+        }
+      })
+    })
+  }
+
+  /**
    * 向会话投递一条消息（唤醒/通知）。
    *
    * 2026-08-19 修复：mode 用 'steer' 而非 'queue'——
@@ -572,6 +617,8 @@ export function apply(ctx: Context, config: Config): void {
     if (!(await waitWebReady(config.readyTimeoutMs))) {
       logger.error('web 未在时限内就绪，跳过唤醒')
       logEvent('web 未在时限内真正就绪（API 探测失败），跳过唤醒')
+      // Telegram 兜底：即便 Web API 未就绪，也让主人知道守护在动
+      await sendTelegram('⚠ [守护] web 重启未在时限内就绪（' + new Date().toLocaleTimeString() + '），请检查 .watch-events.log')
       return
     }
     const sessions = await listSessions()
@@ -586,6 +633,8 @@ export function apply(ctx: Context, config: Config): void {
       logger.info('未找到唤醒目标会话，跳过')
       logEvent('未找到唤醒目标会话，跳过')
     }
+    // 2026-08-25：web 就绪后同步发 Telegram 通知主人（watch 独立发，不依赖 web 的 telegram 插件）
+    await sendTelegram('✅ [守护] web 已重启就绪（' + new Date().toLocaleTimeString() + '）。')
   }
 
   // 查找占用 config.port 的外部进程 pid（netstat 解析）
@@ -757,6 +806,10 @@ export function apply(ctx: Context, config: Config): void {
         logger.info('端口 ' + String(config.port) + ' 未被占用，自动拉起 web...')
         logEvent('端口空闲，自动拉起 web')
         await spawnWeb(config.defaultWorkspace || process.cwd())
+        // 2026-08-25 修复：自动拉起路径补齐唤醒——与哨兵周期一致，
+        // web 就绪后通知最近活跃会话「守护已拉起 web」（此前仅哨兵周期发唤醒，
+        // watch 自身重启后自动拉起时主会话收不到消息）。
+        await decideAndWake()
       } else if (config.adoptExternal) {
         logEvent('端口已被占用——尝试收养外部 dsh web')
         await adoptExternalWeb()

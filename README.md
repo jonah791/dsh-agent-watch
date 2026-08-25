@@ -1,3 +1,13 @@
+<!--
+  DSH 插件生态公约声明（plugin-ecosystem-convention · 组合优先/声明清晰/兼容优先）
+  purpose: 哨卫插件（dsh-agent-watch）：跨工作区通用的 DSH Web 守护。监听全局哨兵文件（DSH_HOME/.hot-reload-flag，JSON {workspace, sessionId}），触发后沙盒预检 → 重启 web（cwd=目标工作区）→ 唤醒目标会话。独立 watch profile 运行，web 崩溃自动拉起。
+  inject: （独立 watch profile）
+  tools: （守护进程，哨兵协议）
+  runtime: host-only
+  envDeps: HTTP 代理（clash，可配置 httpProxy）
+  boundary: 无特殊授权边界
+  compat: cordis ^4.0.1 / dsh-tools ^0.1.0-rc.6
+-->
 # dsh-agent-watch — 哨卫插件（跨工作区通用守护）
 
 DSH Web 的常驻守护，以独立 **watch profile** 运行（与 web 进程分离，web 崩溃不连坐）。
