@@ -288,8 +288,91 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  // 预检复合：①插件静态健康检查（fail-closed）→ ②磁盘空间 → ③试运行（完整组合加载）
-  const preflight = async (workspace: string): Promise<{ pass: boolean; output: string }> => {
+  // —— 会话日志完整性检查（2026-08-26 预检增强·主人定调「增强预检 + 改插件」）——
+  // 背景：外部插件（dsh-agent-teams）曾写 `agent-teams/*` 未知事件类型（不在 harness
+  // KNOWN_SESSION_EVENT_TYPES 且无 ignorable）→ 重启后 harness 读该会话日志抛
+  // SessionFormatUnsupportedError → 会话卡死（2026-08-26 事故，预检此前拦不住）。
+  // 本检查：重启前扫描最近活跃会话日志，解压检测未知事件类型信号，提前拦截。
+  const ZSTD_MAGIC = 0xFD2FB528
+  /** 简化 zstd 帧扫描（拷贝自 harness scanZstdFrames 思路）：返回完整帧边界。 */
+  function scanZstdFrames(buf: Buffer): Array<{ start: number; end: number }> {
+    const frames: Array<{ start: number; end: number }> = []
+    let offset = 0
+    while (offset < buf.length) {
+      const start = offset
+      if (buf.length - offset < 4) return frames
+      if (buf.readUInt32LE(offset) !== ZSTD_MAGIC) return frames // 非 zstd 或损坏，停止
+      offset += 4
+      if (offset === buf.length) return frames
+      const descriptor = buf.readUInt8(offset)
+      offset += 1
+      if ((descriptor & 0x18) !== 0) return frames
+      const contentSizeFlag = descriptor >>> 6
+      const singleSegment = (descriptor & 0x20) !== 0
+      const checksum = (descriptor & 0x04) !== 0
+      const dictionaryFlag = descriptor & 0x03
+      const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+      const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+      const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+      if (buf.length - offset < remainingHeaderBytes) return frames
+      offset += remainingHeaderBytes
+      for (;;) {
+        if (buf.length - offset < 3) return frames
+        const blockHeader = buf.readUIntLE(offset, 3)
+        offset += 3
+        const lastBlock = (blockHeader & 1) !== 0
+        const blockType = (blockHeader >>> 1) & 0x03
+        const blockSize = blockHeader >>> 3
+        if (blockType === 0x03) return frames
+        const payloadBytes = blockType === 0x01 ? 1 : blockSize
+        if (buf.length - offset < payloadBytes) return frames
+        offset += payloadBytes
+        if (lastBlock) break
+      }
+      if (checksum) {
+        if (buf.length - offset < 4) return frames
+        offset += 4
+      }
+      frames.push({ start, end: offset })
+    }
+    return frames
+  }
+  /** 解压一个会话日志，检测未知事件类型信号（启发式：agent-teams/ 前缀）。 */
+  function sessionLogHasUnknownEvents(workspace: string): string | null {
+    try {
+      const fsMod = require('node:fs') as typeof import('node:fs')
+      const zlibMod = require('node:zlib') as typeof import('node:zlib')
+      const sessionsDir = join(config.dshHome || process.cwd(), 'sessions')
+      if (!fsMod.existsSync(sessionsDir)) return null
+      const wsEnc = '--' + workspace.replaceAll('\\', '-').replaceAll('/', '-').replaceAll(':', '-') + '--'
+      const wsDir = join(sessionsDir, wsEnc)
+      if (!fsMod.existsSync(wsDir)) return null
+      // 取最新修改的 3 个会话日志
+      const logs = fsMod.readdirSync(wsDir)
+        .map((d) => join(wsDir, d, 'session.jsonl.zstd'))
+        .filter((p) => fsMod.existsSync(p))
+        .sort((a, b) => fsMod.statSync(b).mtimeMs - fsMod.statSync(a).mtimeMs)
+        .slice(0, 3)
+      for (const logPath of logs) {
+        const buf = fsMod.readFileSync(logPath)
+        const frames = scanZstdFrames(buf)
+        let plain = ''
+        for (const { start, end } of frames.slice(0, 50)) { // 限制解压帧数防慢
+          try {
+            plain += zlibMod.zstdDecompressSync(buf.subarray(start, end)).toString('utf8')
+          } catch { /* 单帧解压失败跳过 */ }
+          if (plain.length > 2 * 1024 * 1024) break // 解压上限 2MB
+        }
+        if (/\"type\":\"agent-teams\//.test(plain)) {
+          return `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先用会话修复工具清理该会话日志，再 touch 哨兵重试`
+        }
+      }
+      return null
+    } catch { return null }
+  }
+
+  // 预检复合：①插件静态健康检查（fail-closed）→ ②磁盘空间 → ③会话日志完整性 → ④试运行（仅 full 模式）
+  const staticChecks = (workspace: string): { pass: boolean; output: string } => {
     // ① 插件静态健康检查（lib 存在 / src 时效 / schema DSL 扫描——tsc 不查、试运行可能漏的都在这里）
     const issues = pluginStaticCheck(workspace)
     if (issues.length > 0) {
@@ -304,8 +387,18 @@ export function apply(ctx: Context, config: Config): void {
       logger.error(out)
       return { pass: false, output: out }
     }
-    // ③ 试运行目标 profile @随机端口，存活 preflightReadyMs 即 PASS
-    return new Promise((resolvePromise) => {
+    // ③ 会话日志完整性（未知事件类型 → 重启会卡死，提前拦截）
+    const logIssue = sessionLogHasUnknownEvents(workspace)
+    if (logIssue) {
+      const out = '[预检] 会话日志检查 FAIL: ' + logIssue
+      logger.error(out)
+      return { pass: false, output: out }
+    }
+    return { pass: true, output: '' }
+  }
+
+  const trialRun = (workspace: string): Promise<{ pass: boolean; output: string }> =>
+    new Promise((resolvePromise) => {
       logger.info('[预检] 试运行 profile "' + config.profile + '" @ ' + workspace + ' ...')
       const child = spawn(process.execPath, ['--expose-internals', bin, '--profile', config.profile, '--port', '0', '--no-open'], { cwd: workspace })
       let out = ''
@@ -321,6 +414,19 @@ export function apply(ctx: Context, config: Config): void {
         resolvePromise({ pass: false, output: out })
       })
     })
+
+  /**
+   * 预检 gate：所有重启路径的统一强制前置（主人 2026-08-26 定调「预检跟重启放在一起、
+   * 强制在重启之前、作为重启的必要条件」）。
+   *   - mode=full：静态 + 磁盘 + 试运行（哨兵周期主动重启/组合变更用，完整验证）
+   *   - mode=quick：静态 + 磁盘（崩溃自愈/自动拉起用，时效优先，毫秒级）
+   * fail-closed：pass=false 即拒绝重启。
+   */
+  const preflight = async (workspace: string, mode: 'full' | 'quick' = 'full'): Promise<{ pass: boolean; output: string }> => {
+    const staticResult = staticChecks(workspace)
+    if (!staticResult.pass) return staticResult
+    if (mode === 'quick') return { pass: true, output: '[预检] 静态检查 PASS（quick 模式，跳过试运行）' }
+    return trialRun(workspace)
   }
 
   // web 进程输出转存：pipe 捕获 stdout/stderr → 转发守护 stderr（cmd 窗口可见）+ 追加到文件（agent 可读诊断）
@@ -420,6 +526,18 @@ export function apply(ctx: Context, config: Config): void {
   const spawnWeb = (workspace: string): Promise<void> =>
     new Promise((resolvePromise) => {
       void (async () => {
+        // 【强制预检 gate · 主人 2026-08-26】所有重启路径（哨兵周期/崩溃自愈/自动拉起/收养自愈）
+        // 统一前置：obey 预检作为重启的必要条件——quick 模式（静态+磁盘，毫秒级，够快不延迟崩溃恢复；
+        // 哨兵周期已另行做 full 试运行，full pass 后此处 quick 必然 pass，不重复）。
+        // fail-closed：预检不过 → 不启动 + 落盘 incident + Telegram 通知主人（web 停机也必须让主人知情）。
+        const gate = await preflight(workspace, 'quick')
+        if (!gate.pass) {
+          writeIncident({ message: 'preflight gate failed; web NOT started', workspace, detail: gate.output.slice(-1500) })
+          logEvent('预检 gate FAIL，拒绝启动 web: ' + gate.output.slice(-300))
+          await sendTelegram('⚠ [守护] 重启被预检 gate 拦截（' + new Date().toLocaleTimeString() + '）：\n' + gate.output.slice(-400))
+          resolvePromise()
+          return
+        }
         // 先清理收养的外部 web（哨兵授权重启 = 接管）
         if (state.externalPid !== null) {
           const pid = state.externalPid
@@ -704,7 +822,7 @@ export function apply(ctx: Context, config: Config): void {
       logger.info('哨兵触发: ' + flagPath + ' | workspace=' + workspace + ' | session=' + String(info.sessionId || '(auto)') + (info.note ? ' | note=' + info.note : ''))
       logEvent('哨兵触发 ' + flagPath + ' workspace=' + workspace + ' session=' + String(info.sessionId || 'auto'))
 
-      const pf = await preflight(workspace)
+      const pf = await preflight(workspace, 'full')
       const pass = pf.pass
       logEvent('预检 ' + (pass ? 'PASS' : 'FAIL') + ' workspace=' + workspace + (pass ? '' : '\n原因: ' + pf.output.slice(-800)))
       if (!pass) {
