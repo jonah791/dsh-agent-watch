@@ -10,6 +10,12 @@
 -->
 # dsh-agent-watch — 哨卫插件（跨工作区通用守护）
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-agent-watch"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 DSH Web 的常驻守护，以独立 **watch profile** 运行（与 web 进程分离，web 崩溃不连坐）。
 **取代旧桌面脚本方案**（D:\桌面\dsh-watch.mjs / dsh-preflight.mjs / 启动DSH-Web（热重载）.cmd，
 已备份至 \`本地备份目录/`）——守护逻辑、预检、启动托管全部插件化。
