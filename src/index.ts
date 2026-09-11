@@ -19,6 +19,7 @@
 import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync, statfsSync, readdirSync, statSync } from 'node:fs'
 import { join, dirname, basename, resolve } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
+import { sendTelegramAlert } from './alert-transport.ts'
 import net from 'node:net'
 import { createRequire } from 'node:module'
 import type { Context } from '@deepseek-ai/cordis'
@@ -631,38 +632,26 @@ export function apply(ctx: Context, config: Config): void {
 
   /**
    * Telegram 通知（2026-08-25）：watch 独立发通知，不依赖 web 的 telegram 插件。
-   * 用 spawn curl + -x 代理（Telegram 被墙需走 clash 代理；Node fetch 无代理 env 会超时，
-   * node:undici 不可用）。参数数组方式传给 curl，无 shell 转义坑。配置了 botToken+chatId 才启用。
+   *
+   * 2026-09-11 传输层修正：原实现用 `spawn curl + -x 代理`，理由是「Telegram 被墙需走 clash 代理；
+   * Node fetch 无代理 env 会超时」——前半句对、后半句只是**缺 flag**：Node 的 EnvHttpProxyAgent
+   * 只在进程启动时读 `NODE_USE_ENV_PROXY`，而守护进程启动时并没有它（该 flag 只被注入 web 子进程），
+   * 所以进程内直接 fetch 确实走不了代理。但本环境实测 curl（schannel 版 8.21.0）经同一代理
+   * **CONNECT 成功、TLS 必失败（exit 35；-k / --http1.1 / --tlsv1.2 各变体均 35）**，
+   * 而 node 子进程注入该 flag 后 fetch 成功（getMe ok=true，sendMessage 实测送达）。
+   * 故改用 alert-transport：主通道 node-fetch 子进程、curl 兜底，结论落盘。
    */
   const sendTelegram = async (text: string): Promise<boolean> => {
-    const token = config.telegramBotToken
-    const chat = config.telegramChatId
-    if (!token || !chat) return false
-    const body = JSON.stringify({ chat_id: Number(chat), text, disable_notification: false })
-    return new Promise<boolean>((resolvePromise) => {
-      const child = spawn('curl.exe', [
-        '-s', '--max-time', '15',
-        '-x', config.httpProxy || 'http://127.0.0.1:16888',
-        '-H', 'Content-Type: application/json',
-        '-d', body,
-        `https://api.telegram.org/bot${token}/sendMessage`,
-      ], { windowsHide: true })
-      let out = ''
-      child.stdout?.on('data', (d: Buffer) => { out += d.toString() })
-      child.stderr?.on('data', (d: Buffer) => { out += d.toString() })
-      child.on('error', (err) => { logEvent('Telegram 通知 spawn 异常: ' + String(err).slice(0, 200)); resolvePromise(false) })
-      child.on('close', (code) => {
-        try {
-          const data = JSON.parse(out) as { ok?: boolean; description?: string }
-          if (data.ok === true) { logEvent('Telegram 通知已发送'); resolvePromise(true); return }
-          logEvent('Telegram 通知失败: ' + String(code) + ' ' + (data.description ?? out.slice(0, 200)))
-          resolvePromise(false)
-        } catch {
-          logEvent('Telegram 通知解析失败: ' + String(code) + ' ' + out.slice(0, 200))
-          resolvePromise(false)
-        }
-      })
+    const r = await sendTelegramAlert({
+      token: config.telegramBotToken,
+      chatId: config.telegramChatId,
+      text,
+      proxy: config.httpProxy || 'http://127.0.0.1:16888',
     })
+    logEvent(r.ok
+      ? 'Telegram 通知已发送（' + r.channel + '）'
+      : 'Telegram 通知失败（' + r.channel + '）：' + r.detail)
+    return r.ok
   }
 
   /**

@@ -84,6 +84,12 @@ cd C:/Users/tr/.dsh/profiles/watch && pnpm exec dsh --profile watch --dump-confi
 
 实测记录（2026-08-16）：哨兵触发 → 预检 PASS → 接管旧 web（36608）→ spawn 新 web → 唤醒目标会话 → 清哨兵，全链路已验证。
 
+## 告警传输（2026-09-11 修正）
+
+Telegram 通知改走 `src/alert-transport.ts`：主通道 spawn node 子进程（注入 `NODE_USE_ENV_PROXY=1`）执行内置 `fetch`，兜底 `curl.exe -x <proxy>`，结论落盘。
+
+原注释的理由「Node fetch 无代理 env 会超时」只对了一半——缺的是**启动期 flag**：Node 的 `EnvHttpProxyAgent` 只在进程启动时读 `NODE_USE_ENV_PROXY`（实测进程内设置该变量后 fetch 仍不走代理），而该 flag 由守护注入 web 子进程、守护自身没有。但本环境的 `curl.exe`（Schannel 8.21.0）经同一代理 **CONNECT 成功、TLS 必失败**（`exit 35`；`-k`／`--http1.1`／`--tlsv1.2` 各变体均 35），同一时刻 Node `fetch` 成功（`getMe` ok=true，`sendMessage` 实测送达）——故两通道并存、以 node-fetch 为主。
+
 ## 相关
 
 - [我的数字生命爱丽丝 — 插件生态中心（架构总览）](https://github.com/jonah791/alice-digital-life)
