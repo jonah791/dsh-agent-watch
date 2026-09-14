@@ -16,8 +16,8 @@
  * 自动模式下从最近活跃会话的 cwd 推断——切换工作区/会话零配置。
  * @module dsh-agent-watch
  */
-import { watch as fsWatch, existsSync, readFileSync, unlinkSync, writeFileSync, mkdirSync, statfsSync, readdirSync, statSync } from 'node:fs'
-import { join, dirname, basename, resolve } from 'node:path'
+import { watch as fsWatch, existsSync, readFileSync, unlinkSync, statfsSync, readdirSync, statSync } from 'node:fs'
+import { join, dirname, basename } from 'node:path'
 import { spawn, execFile, type ChildProcess } from 'node:child_process'
 import { sendTelegramAlert } from './alert-transport.ts'
 import net from 'node:net'
@@ -25,6 +25,33 @@ import { createRequire } from 'node:module'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { parseFlag, type FlagInfo } from './flag.ts'
+// 纯决策层（可离线单测，见 tests/watch-plan.test.mjs）+ 落盘薄壳（tests/durable-io.test.mjs）
+import {
+  buildFlagPaths,
+  checkDiskFree,
+  exitVerdict,
+  findActiveSession,
+  firstStaleTsSource,
+  freeMbOf,
+  hasUnknownEventSignal,
+  isDshWebCommandLine,
+  libMissingIssue,
+  libUnreadableIssue,
+  parseNetstatOwner,
+  pickWakeTarget,
+  preflightModeFor,
+  resolveWorkspace,
+  scanZstdFrames,
+  schemaDslViolation,
+  schemaViolationIssue,
+  staleSourceIssue,
+  unknownEventIssue,
+  webLogPath,
+  webLogTruncateTo,
+  shouldTruncateWebLog,
+  type SessionItem,
+} from './watch-plan.ts'
+import { appendLineSafe, writeJsonSafeDetailed } from './durable-io.ts'
 
 export const name = 'agent-watch'
 
@@ -101,17 +128,9 @@ const norm = (p: string) => p.replaceAll('\\', '/')
 function makeEventLogger(dshHome: string): (msg: string) => void {
   const file = join(dshHome || process.cwd(), '.watch-events.log')
   return (msg: string) => {
-    try {
-      writeFileSync(file, '[' + new Date().toISOString() + '] ' + msg + '\n', { flag: 'a' })
-    } catch { /* 事件日志失败不影响主流程 */ }
+    // 事件日志失败不影响主流程（appendLineSafe 吞错返回 bool）
+    appendLineSafe(file, '[' + new Date().toISOString() + '] ' + msg + '\n')
   }
-}
-
-interface SessionItem {
-  sessionId?: string
-  cwd?: string
-  blank?: boolean
-  updatedAt?: number
 }
 
 export function apply(ctx: Context, config: Config): void {
@@ -146,11 +165,13 @@ export function apply(ctx: Context, config: Config): void {
 
   const dshHome = config.dshHome || process.env.DSH_HOME || ''
   const logEvent = makeEventLogger(dshHome)
-  const flagPaths = [
-    ...(config.watchDirs.length > 0 ? config.watchDirs : (dshHome ? [dshHome] : [process.cwd()]))
-      .map((d) => resolve(d, config.flagFile)),
-    ...config.legacyFlags.map((f) => resolve(f)),
-  ].filter((p, i, arr) => arr.indexOf(p) === i)
+  // 监听路径集合 = buildFlagPaths（watch-plan.ts，纯函数：配置切片 + cwd 显式注入）
+  const flagPaths = buildFlagPaths({
+    dshHome,
+    watchDirs: config.watchDirs,
+    flagFile: config.flagFile,
+    legacyFlags: config.legacyFlags,
+  }, process.cwd())
 
   const state: {
     child: ChildProcess | null
@@ -179,14 +200,10 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   const writeIncident = (detail: Record<string, unknown>) => {
-    try {
-      const file = config.incidentFile || join(dshHome || process.cwd(), '.watch-incident.json')
-      mkdirSync(dirname(file), { recursive: true })
-      writeFileSync(file, JSON.stringify({ at: new Date().toISOString(), ...detail }, null, 2), 'utf8')
-      logger.error('事故已落盘: ' + file)
-    } catch (err) {
-      logger.error('事故落盘失败: ' + String(err))
-    }
+    const file = config.incidentFile || join(dshHome || process.cwd(), '.watch-incident.json')
+    // 事故落盘 = 观测层：失败不反噬守护（吞错返回结果，文案与原实现逐字一致）
+    const r = writeJsonSafeDetailed(file, { at: new Date().toISOString(), ...detail })
+    logger.error(r.ok ? '事故已落盘: ' + file : '事故落盘失败: ' + String(r.error))
   }
 
   const portInUse = (port: number) =>
@@ -220,8 +237,7 @@ export function apply(ctx: Context, config: Config): void {
     }
   }
 
-  const findActiveSession = (items: SessionItem[]) =>
-    items.filter((s) => !s.blank).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]
+  // 最新活跃会话挑选 = findActiveSession（watch-plan.ts，纯函数）
 
   const workspaceOfSession = async (sessionId: string): Promise<string | undefined> => {
     const items = await listSessions()
@@ -241,7 +257,6 @@ export function apply(ctx: Context, config: Config): void {
     const dir = selfPluginsDir(workspace)
     let entries: string[] = []
     try { entries = readdirSync(dir) } catch { return ['self-plugins 目录不可读: ' + dir] }
-    const scanRe = /items\s*:\s*\{[\s\S]{0,1000}?required\s*:\s*\[/g
     for (const name of entries) {
       const pkgDir = join(dir, name)
       let st: ReturnType<typeof statSync>
@@ -251,39 +266,34 @@ export function apply(ctx: Context, config: Config): void {
       if (!existsSync(pkgJson)) continue // 非插件目录
       const lib = join(pkgDir, 'lib', 'index.js')
       if (!existsSync(lib)) {
-        issues.push(name + ': lib/index.js 缺失（未构建？重启后插件无法加载）')
+        issues.push(libMissingIssue(name))
         continue
       }
-      // src 时效：任一 src/*.ts 比 lib/index.js 新 → 改了没构建
+      // src 时效：任一 src/*.ts 比 lib/index.js 新 → 改了没构建（判据 = firstStaleTsSource，纯函数）
       const libMtime = statSync(lib).mtimeMs
       const srcDir = join(pkgDir, 'src')
       try {
-        for (const f of readdirSync(srcDir)) {
-          if (!f.endsWith('.ts')) continue
-          if (statSync(join(srcDir, f)).mtimeMs > libMtime) {
-            issues.push(name + ': src/' + f + ' 比 lib 新（改了没构建——重启会加载旧代码）')
-            break
-          }
-        }
+        const files = readdirSync(srcDir)
+          .filter((f) => f.endsWith('.ts'))
+          .map((f) => ({ name: f, mtimeMs: statSync(join(srcDir, f)).mtimeMs }))
+        const stale = firstStaleTsSource(files, libMtime)
+        if (stale !== null) issues.push(staleSourceIssue(name, stale))
       } catch { /* src 不存在 = 纯 lib 插件，跳过 */ }
-      // schema DSL 静态扫描（items 内 required 数组）
+      // schema DSL 静态扫描（items 内 required 数组）= schemaDslViolation（纯函数）
       try {
         const libText = readFileSync(lib, 'utf8')
-        scanRe.lastIndex = 0
-        if (scanRe.test(libText)) {
-          issues.push(name + ': 工具 schema 违规（items 内 object 级 required 数组——dsh-tools DSL 不支持，仅允许字段级 required: true）')
+        if (schemaDslViolation(libText)) {
+          issues.push(schemaViolationIssue(name))
         }
-      } catch { issues.push(name + ': lib/index.js 读取失败') }
+      } catch { issues.push(libUnreadableIssue(name)) }
     }
     return issues
   }
   function diskCheck(): { ok: boolean; message: string } {
     try {
       const s = statfsSync(dshHome || process.cwd())
-      const freeMB = Math.floor((s.bavail * s.bsize) / 1024 / 1024)
-      const min = 200
-      if (freeMB < min) return { ok: false, message: '磁盘空间不足: ' + freeMB + 'MB（< ' + min + 'MB）——重启/日志写入有风险' }
-      return { ok: true, message: '磁盘可用 ' + freeMB + 'MB' }
+      // 判据（阈值与文案）= checkDiskFree / freeMbOf（watch-plan.ts，纯函数）
+      return checkDiskFree(freeMbOf({ bavail: s.bavail, bsize: s.bsize }))
     } catch (e) {
       return { ok: false, message: '磁盘检查失败: ' + String((e as Error).message ?? e).slice(0, 200) }
     }
@@ -294,50 +304,7 @@ export function apply(ctx: Context, config: Config): void {
   // KNOWN_SESSION_EVENT_TYPES 且无 ignorable）→ 重启后 harness 读该会话日志抛
   // SessionFormatUnsupportedError → 会话卡死（2026-08-26 事故，预检此前拦不住）。
   // 本检查：重启前扫描最近活跃会话日志，解压检测未知事件类型信号，提前拦截。
-  const ZSTD_MAGIC = 0xFD2FB528
-  /** 简化 zstd 帧扫描（拷贝自 harness scanZstdFrames 思路）：返回完整帧边界。 */
-  function scanZstdFrames(buf: Buffer): Array<{ start: number; end: number }> {
-    const frames: Array<{ start: number; end: number }> = []
-    let offset = 0
-    while (offset < buf.length) {
-      const start = offset
-      if (buf.length - offset < 4) return frames
-      if (buf.readUInt32LE(offset) !== ZSTD_MAGIC) return frames // 非 zstd 或损坏，停止
-      offset += 4
-      if (offset === buf.length) return frames
-      const descriptor = buf.readUInt8(offset)
-      offset += 1
-      if ((descriptor & 0x18) !== 0) return frames
-      const contentSizeFlag = descriptor >>> 6
-      const singleSegment = (descriptor & 0x20) !== 0
-      const checksum = (descriptor & 0x04) !== 0
-      const dictionaryFlag = descriptor & 0x03
-      const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
-      const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
-      const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
-      if (buf.length - offset < remainingHeaderBytes) return frames
-      offset += remainingHeaderBytes
-      for (;;) {
-        if (buf.length - offset < 3) return frames
-        const blockHeader = buf.readUIntLE(offset, 3)
-        offset += 3
-        const lastBlock = (blockHeader & 1) !== 0
-        const blockType = (blockHeader >>> 1) & 0x03
-        const blockSize = blockHeader >>> 3
-        if (blockType === 0x03) return frames
-        const payloadBytes = blockType === 0x01 ? 1 : blockSize
-        if (buf.length - offset < payloadBytes) return frames
-        offset += payloadBytes
-        if (lastBlock) break
-      }
-      if (checksum) {
-        if (buf.length - offset < 4) return frames
-        offset += 4
-      }
-      frames.push({ start, end: offset })
-    }
-    return frames
-  }
+  // zstd 帧扫描 = scanZstdFrames（watch-plan.ts，原函数整体搬移，纯函数可单测）
   /** 解压一个会话日志，检测未知事件类型信号（启发式：agent-teams/ 前缀）。 */
   function sessionLogHasUnknownEvents(workspace: string): string | null {
     try {
@@ -364,8 +331,8 @@ export function apply(ctx: Context, config: Config): void {
           } catch { /* 单帧解压失败跳过 */ }
           if (plain.length > 2 * 1024 * 1024) break // 解压上限 2MB
         }
-        if (/\"type\":\"agent-teams\//.test(plain)) {
-          return `会话日志 ${logPath} 含未知事件类型 agent-teams/*（harness 拒读 → 重启卡死）。请先用会话修复工具清理该会话日志，再 touch 哨兵重试`
+        if (hasUnknownEventSignal(plain)) {
+          return unknownEventIssue(logPath)
         }
       }
       return null
@@ -431,14 +398,15 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // web 进程输出转存：pipe 捕获 stdout/stderr → 转发守护 stderr（cmd 窗口可见）+ 追加到文件（agent 可读诊断）
-  const webLogFile = () => join(dshHome || process.cwd(), '.watch-web.log')
+  // 判据（路径/上限/截断点）= watch-plan.ts 的 webLogPath/shouldTruncateWebLog/webLogTruncateTo（纯函数）
+  const webLogFile = () => webLogPath(dshHome, process.cwd())
   const writeWebLog = (stream: string, chunk: Buffer) => {
     try {
       const fs = require('node:fs') as typeof import('node:fs')
-      const max = 2 * 1024 * 1024
       const file = webLogFile()
-      if (fs.existsSync(file) && fs.statSync(file).size > max) fs.truncateSync(file, Math.floor(max / 2))
-      fs.appendFileSync(file, '[' + new Date().toISOString() + ' ' + stream + '] ' + chunk.toString('utf8'))
+      const size = fs.existsSync(file) ? fs.statSync(file).size : undefined
+      if (shouldTruncateWebLog(size)) fs.truncateSync(file, webLogTruncateTo())
+      appendLineSafe(file, '[' + new Date().toISOString() + ' ' + stream + '] ' + chunk.toString('utf8'))
     } catch { /* 转存失败不影响主流程 */ }
   }
 
@@ -474,6 +442,7 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   // 判断 pid 是否是 dsh web 进程（命令行匹配 bin.js web / @deepseek-ai/dsh）
+  // 判据本体 = isDshWebCommandLine（watch-plan.ts，纯函数）
   const isDshWebProcess = async (pid: number): Promise<boolean> => {
     try {
       const out = await new Promise<string>((resolvePromise, reject) => {
@@ -481,7 +450,7 @@ export function apply(ctx: Context, config: Config): void {
           if (err) reject(err); else resolvePromise(stdout)
         })
       })
-      return (/bin\.js/.test(out) && /\bweb\b/.test(out)) || /@deepseek-ai\/dsh/.test(out)
+      return isDshWebCommandLine(out)
     } catch { return false }
   }
 
@@ -531,7 +500,7 @@ export function apply(ctx: Context, config: Config): void {
         // 统一前置：obey 预检作为重启的必要条件——quick 模式（静态+磁盘，毫秒级，够快不延迟崩溃恢复；
         // 哨兵周期已另行做 full 试运行，full pass 后此处 quick 必然 pass，不重复）。
         // fail-closed：预检不过 → 不启动 + 落盘 incident + Telegram 通知主人（web 停机也必须让主人知情）。
-        const gate = await preflight(workspace, 'quick')
+        const gate = await preflight(workspace, preflightModeFor('launch'))
         if (!gate.pass) {
           writeIncident({ message: 'preflight gate failed; web NOT started', workspace, detail: gate.output.slice(-1500) })
           logEvent('预检 gate FAIL，拒绝启动 web: ' + gate.output.slice(-300))
@@ -607,10 +576,12 @@ export function apply(ctx: Context, config: Config): void {
         void spawnWeb(state.lastWorkspace)
         return
       }
-      state.quickExitCount = quick ? state.quickExitCount + 1 : 0
+      // 快速退出计数与熔断判据 = exitVerdict（watch-plan.ts，纯函数）
+      const verdict = exitVerdict({ quick, quickExitCount: state.quickExitCount, maxQuickExits: config.maxQuickExits })
+      state.quickExitCount = verdict.nextQuickExitCount
       logger.warn('web 退出（code=' + String(code) + ' signal=' + String(signal) + '）quick=' + String(quick) + ' count=' + String(state.quickExitCount))
       logEvent('web 退出 code=' + String(code) + ' signal=' + String(signal) + ' quickCount=' + String(state.quickExitCount))
-      if (state.quickExitCount >= config.maxQuickExits) {
+      if (verdict.stopRestart) {
         logger.error('连续 ' + String(config.maxQuickExits) + ' 次快速退出——停止自动重启（修复后 touch 哨兵可再次触发）')
         writeIncident({ code, signal: String(signal), message: 'web 连续 ' + String(config.maxQuickExits) + ' 次快速退出，已停止自动重启' })
         return
@@ -729,9 +700,9 @@ export function apply(ctx: Context, config: Config): void {
       return
     }
     const sessions = await listSessions()
-    let sid = explicitId !== undefined && sessions.some((s) => s.sessionId === explicitId) ? explicitId : undefined
-    logEvent('唤醒决策: explicit=' + String(explicitId ?? '无') + ' 列表=' + sessions.map((s) => s.sessionId).join(',') + ' → 初选=' + String(sid ?? '待回退'))
-    if (!sid) sid = findActiveSession(sessions)?.sessionId
+    const pick = pickWakeTarget(sessions, explicitId)
+    const sid = pick.sid
+    logEvent('唤醒决策: explicit=' + String(explicitId ?? '无') + ' 列表=' + sessions.map((s) => s.sessionId).join(',') + ' → 初选=' + String(pick.explicitSid ?? '待回退'))
     logEvent('唤醒目标: ' + String(sid ?? '无（跳过）'))
     if (sid) {
       const sent = await wakeSession(sid)
@@ -744,7 +715,7 @@ export function apply(ctx: Context, config: Config): void {
     await sendTelegram('✅ [守护] web 已重启就绪（' + new Date().toLocaleTimeString() + '）。')
   }
 
-  // 查找占用 config.port 的外部进程 pid（netstat 解析）
+  // 查找占用 config.port 的外部进程 pid（netstat 解析）——解析判据 = parseNetstatOwner（纯函数）
   const portOwnerPid = async (): Promise<number | null> => {
     try {
       const out = await new Promise<string>((resolvePromise, reject) => {
@@ -752,10 +723,7 @@ export function apply(ctx: Context, config: Config): void {
           if (err) reject(err); else resolvePromise(stdout)
         })
       })
-      for (const line of out.split(/\r?\n/)) {
-        const m = line.trim().match(new RegExp('TCP\\s+127\\.0\\.0\\.1:' + config.port + '\\s+0\\.0\\.0\\.0:0\\s+LISTENING\\s+(\\d+)'))
-        if (m && m[1]) return Number(m[1])
-      }
+      return parseNetstatOwner(out, config.port)
     } catch { /* 解析失败返回 null */ }
     return null
   }
@@ -802,16 +770,21 @@ export function apply(ctx: Context, config: Config): void {
           info = parseFlag(raw2)
         } catch { /* 忽略 */ }
       }
-      let workspace = info.workspace
-      if (!workspace && info.sessionId) {
-        workspace = await workspaceOfSession(info.sessionId)
-        if (workspace) logger.info('workspace 从会话推断: ' + workspace)
+      // workspace 决议顺序（哨兵显式 → 会话推断 → 兜底）= resolveWorkspace（纯函数）
+      let inferred: string | undefined
+      if (!info.workspace && info.sessionId) {
+        inferred = await workspaceOfSession(info.sessionId)
+        if (inferred) logger.info('workspace 从会话推断: ' + inferred)
       }
-      if (!workspace) workspace = config.defaultWorkspace || process.cwd()
+      const workspace = resolveWorkspace({
+        flagWorkspace: info.workspace,
+        inferredWorkspace: inferred,
+        fallback: config.defaultWorkspace || process.cwd(),
+      })
       logger.info('哨兵触发: ' + flagPath + ' | workspace=' + workspace + ' | session=' + String(info.sessionId || '(auto)') + (info.note ? ' | note=' + info.note : ''))
       logEvent('哨兵触发 ' + flagPath + ' workspace=' + workspace + ' session=' + String(info.sessionId || 'auto'))
 
-      const pf = await preflight(workspace, 'full')
+      const pf = await preflight(workspace, preflightModeFor('sentinel'))
       const pass = pf.pass
       logEvent('预检 ' + (pass ? 'PASS' : 'FAIL') + ' workspace=' + workspace + (pass ? '' : '\n原因: ' + pf.output.slice(-800)))
       if (!pass) {
