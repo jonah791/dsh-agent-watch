@@ -29,6 +29,7 @@ import { parseFlag, type FlagInfo } from './flag.ts'
 import {
   buildFlagPaths,
   checkDiskFree,
+  decideSpawnGate,
   exitVerdict,
   findActiveSession,
   firstStaleTsSource,
@@ -454,6 +455,21 @@ export function apply(ctx: Context, config: Config): void {
     } catch { return false }
   }
 
+  // 进程启动时刻（ms；取不到 → null）。用途：decideSpawnGate 分辨「陈旧持有者」与「本轮新起的 web」。
+  const processStartMs = async (pid: number): Promise<number | null> => {
+    try {
+      const out = await new Promise<string>((resolvePromise, reject) => {
+        execFile('powershell', ['-NoProfile', '-Command',
+          '[int64]([DateTimeOffset](Get-Process -Id ' + String(pid) + ').StartTime).ToUnixTimeMilliseconds()'],
+          { timeout: 8000 }, (err, stdout) => {
+            if (err) reject(err); else resolvePromise(stdout)
+          })
+      })
+      const n = Number(out.trim())
+      return Number.isFinite(n) && n > 0 ? n : null
+    } catch { return null }
+  }
+
   // 收养外部 dsh web：启动时端口被占且占用者是 dsh web → 记录托管 + 轮询崩溃自愈（零互踢）
   const adoptExternalWeb = async (): Promise<void> => {
     const pid = await portOwnerPid()
@@ -508,29 +524,53 @@ export function apply(ctx: Context, config: Config): void {
           resolvePromise()
           return
         }
-        // 先清理收养的外部 web（哨兵授权重启 = 接管）
+        // ── 「谁在服务」裁决（2026-09-18 事故修复）──────────────────────────────
+        // 事故形状：kill 目标取的是**记录里的 pid**（`.sentinel-web-start.json` 里那个甚至早于当轮启动），
+        // 真监听者从未被杀 ⇒ 新进程 bind 端口 EADDRINUSE 崩掉 ⇒ 三次「重启」全部静默落空、而每一环都报成功。
+        // 判据本体 = watch-plan.ts:decideSpawnGate（纯函数，离线单测）：
+        //   **只有「刚起来的那个」才配被收养**，早于本轮重启的一律视为陈旧持有者，先杀再起。
+        const restartStartedAtMs = Date.now()
+        // ① 先按记录清一次（无害；常见情形它就是要杀的那个）
         if (state.externalPid !== null) {
           const pid = state.externalPid
           state.externalPid = null
           if (state.externalTimer) { clearInterval(state.externalTimer); state.externalTimer = null }
           const killed = await killWeb(pid)
-          if (!killed) {
-            logEvent('收养的 web（PID ' + pid + '）kill 失败——中止本次重启（哨兵保留）')
-            return
-          }
+          if (!killed) logEvent('收养的 web（PID ' + pid + '）kill 失败——继续按端口持有者裁决')
         }
-        // 端口最终防线：netstat LISTENING 检查（连接探测有空窗：kill 瞬间连接被拒但监听未释放）
-        const owner = await portOwnerPid()
-        if (owner !== null) {
-          if (await isDshWebProcess(owner)) {
-            // 已有活 dsh web 在服务：收养它，不重复拉起（防 EADDRINUSE 双 web）
-            logEvent('端口被活 dsh web 占用（PID ' + owner + '）——收养接管，跳过本次拉起')
+        // ② 再按端口持有者裁决（最多两轮：杀完陈旧者后复判一次）
+        for (let round = 0; round < 2; round += 1) {
+          const owner = await portOwnerPid()
+          const ownerIsDshWeb = owner !== null ? await isDshWebProcess(owner) : false
+          const ownerStartMs = owner !== null ? await processStartMs(owner) : null
+          const verdict = decideSpawnGate({
+            recordedPid: null, // 记录的 pid 已在 ① 处理
+            portOwnerPid: owner,
+            ownerIsDshWeb,
+            restartStartedAtMs,
+            ownerStartMs,
+          })
+          if (verdict.decision === 'adopt') {
+            logEvent('端口被活 dsh web 占用（PID ' + String(owner) + '）——' + verdict.reason + '，收养接管，跳过本次拉起')
             state.externalPid = owner
             return
           }
-          logEvent('端口 ' + String(config.port) + ' 被非 dsh 进程占用（PID ' + owner + '），等待释放后启动...')
-          await waitPortFree()
-          if (state.manualStop) return
+          if (verdict.decision === 'wait-port') {
+            logEvent('端口 ' + String(config.port) + ' 被非 dsh 进程占用（PID ' + String(owner) + '），等待释放后启动...')
+            await waitPortFree()
+            if (state.manualStop) return
+            break
+          }
+          if (verdict.decision === 'kill-port-owner') {
+            logEvent('⭐ 陈旧端口持有者（PID ' + String(owner) + '，startMs=' + String(ownerStartMs) + '，本轮重启起于 ' + String(restartStartedAtMs) + '）：' + verdict.reason)
+            const killed = await killWeb(owner as number)
+            if (!killed) {
+              logEvent('陈旧持有者 kill 失败——中止本次重启（哨兵保留等待重试）')
+              return
+            }
+            continue
+          }
+          break // spawn
         }
         const cmd = config.launchCmd.length > 0 ? config.launchCmd : [process.execPath, '--expose-internals', bin, '--profile', config.profile, '--no-open']
         logger.info('启动 web: ' + cmd.join(' ') + '（cwd=' + workspace + '）...')
@@ -557,6 +597,17 @@ export function apply(ctx: Context, config: Config): void {
           if (state.child === child) state.child = null
           onWebExit(code, signal)
         })
+        // 重启后**自证**（8s 后读一次端口持有者）：把「谁在服务」写进事件日志，
+        // 让「这次重启到底生效了没有」变成一条 `tail` 就能回答的问题（2026-09-18 事故的直接补丁）。
+        setTimeout(() => {
+          void (async () => {
+            try {
+              const owner = await portOwnerPid()
+              const startMs = owner !== null ? await processStartMs(owner) : null
+              logEvent('port-owner-after-restart={pid=' + String(owner) + ',startMs=' + String(startMs) + '}（本轮重启起于 ' + String(restartStartedAtMs) + '；startMs 必须**晚于**该时刻才算生效）')
+            } catch { /* 只读诊断，失败不影响主流程 */ }
+          })()
+        }, 8000)
         resolvePromise()
       })()
     })

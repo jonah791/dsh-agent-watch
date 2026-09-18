@@ -127,6 +127,55 @@ export function isDshWebCommandLine(commandLine: string): boolean {
   return (/bin\.js/.test(commandLine) && /\bweb\b/.test(commandLine)) || /@deepseek-ai\/dsh/.test(commandLine)
 }
 
+/** 「谁在服务」裁决的输入。 */
+export interface SpawnGateInput {
+  /** 守护记录/收养的 web pid（**可能是陈旧记录**）。 */
+  recordedPid: number | null
+  /** 当前监听端口的 pid（null＝端口空闲）。 */
+  portOwnerPid: number | null
+  /** 端口持有者是否 dsh web 进程。 */
+  ownerIsDshWeb: boolean
+  /** 本次重启发起时刻（ms）。 */
+  restartStartedAtMs: number
+  /** 端口持有者的启动时刻（ms；取不到＝null）。 */
+  ownerStartMs: number | null
+}
+
+/** 裁决结果：`spawn`＝直接拉起 / `adopt`＝收养现有 / `kill-port-owner`＝杀掉陈旧持有者再起 / `wait-port`＝等别人释放。 */
+export type SpawnGateDecision = 'spawn' | 'adopt' | 'kill-port-owner' | 'wait-port'
+
+/**
+ * 重启前的「谁在服务」裁决（**2026-09-18 事故的修复核心**）。
+ *
+ * 事故形状：`killWeb` 的目标取的是**记录里的 pid**（`.sentinel-web-start.json` 里那个甚至早于当轮启动），
+ * 真监听者从未被杀 ⇒ 新进程 `bind` 端口时 `EADDRINUSE` 崩掉 ⇒ **三次「重启」全部静默落空，而每一环都报成功**。
+ *
+ * 判据：**只有「刚起来的那个」才配被收养**
+ *   - 端口空闲 ⇒ `spawn`
+ *   - 占用者非 dsh web ⇒ `wait-port`（不抢别人的端口）
+ *   - 占用者 == 记录的 pid ⇒ `adopt`
+ *   - 占用者启动时刻**晚于**本次重启发起 ⇒ `adopt`（它就是本轮新起的）
+ *   - 其余 ⇒ **`kill-port-owner`**（占用者早于本轮重启 = 陈旧，必须杀掉再起）
+ *   - 启动时刻取不到（null）⇒ 同样 `kill-port-owner`：**朝行动一侧失败，不朝「跳过」一侧**
+ */
+export function decideSpawnGate(i: SpawnGateInput): { decision: SpawnGateDecision; reason: string } {
+  if (i.portOwnerPid === null) return { decision: 'spawn', reason: '端口空闲' }
+  if (!i.ownerIsDshWeb) {
+    return { decision: 'wait-port', reason: '占用者非 dsh web（PID ' + String(i.portOwnerPid) + '）——不抢端口，等释放' }
+  }
+  if (i.recordedPid !== null && i.portOwnerPid === i.recordedPid) {
+    return { decision: 'adopt', reason: '占用者 == 记录的 web pid' }
+  }
+  if (i.ownerStartMs !== null && i.ownerStartMs > i.restartStartedAtMs) {
+    return { decision: 'adopt', reason: '占用者启动于本次重启之后（本轮新起的 web）' }
+  }
+  return {
+    decision: 'kill-port-owner',
+    reason:
+      '占用者早于本次重启（或启动时刻取不到）⇒ 陈旧持有者：必须杀掉再起，否则新进程 EADDRINUSE 静默落空',
+  }
+}
+
 /** lib 产物缺失/未构建问题的文案（原 `pluginStaticCheck` 逐字）。 */
 export function libMissingIssue(pluginName: string): string {
   return pluginName + ': lib/index.js 缺失（未构建？重启后插件无法加载）'

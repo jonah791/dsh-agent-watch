@@ -14,6 +14,7 @@ import {
   MIN_FREE_MB,
   buildFlagPaths,
   checkDiskFree,
+  decideSpawnGate,
   exitVerdict,
   findActiveSession,
   firstStaleTsSource,
@@ -243,4 +244,51 @@ test('webLogPath / 滚存阈值：2MB 上限、截断一半、严格大于才截
   assert.equal(shouldTruncateWebLog(2 * 1024 * 1024), false) // 边界：恰好等于上限不截断
   assert.equal(shouldTruncateWebLog(2 * 1024 * 1024 + 1), true)
   assert.equal(shouldTruncateWebLog(undefined), false) // 文件不存在 → 不截断（不抛）
+})
+
+// ── 「谁在服务」裁决（2026-09-18 事故修复的判据本体）──────────────────
+// 事故：kill 打的是陈旧记录 pid ⇒ 旧 web 一直占端口，新进程 EADDRINUSE 崩掉 ⇒
+// 三次「重启」全部报成功而效果未发生。以下用例把「只有刚起来的才配被收养」钉死。
+test('decideSpawnGate：端口空闲 ⇒ spawn', () => {
+  const v = decideSpawnGate({ recordedPid: null, portOwnerPid: null, ownerIsDshWeb: false, restartStartedAtMs: 1000, ownerStartMs: null })
+  assert.equal(v.decision, 'spawn')
+})
+
+test('decideSpawnGate：占用者非 dsh web ⇒ wait-port（不抢别人的端口）', () => {
+  const v = decideSpawnGate({ recordedPid: null, portOwnerPid: 999, ownerIsDshWeb: false, restartStartedAtMs: 1000, ownerStartMs: 100 })
+  assert.equal(v.decision, 'wait-port')
+})
+
+test('decideSpawnGate：占用者 == 记录的 pid ⇒ adopt', () => {
+  const v = decideSpawnGate({ recordedPid: 4242, portOwnerPid: 4242, ownerIsDshWeb: true, restartStartedAtMs: 1000, ownerStartMs: 100 })
+  assert.equal(v.decision, 'adopt')
+})
+
+test('decideSpawnGate：占用者启动于本次重启之后 ⇒ adopt（本轮新起的）', () => {
+  const v = decideSpawnGate({ recordedPid: null, portOwnerPid: 5000, ownerIsDshWeb: true, restartStartedAtMs: 1_700_000_000_000, ownerStartMs: 1_700_000_000_500 })
+  assert.equal(v.decision, 'adopt')
+})
+
+test('⭐ 尸体测试：占用者早于本次重启 ⇒ kill-port-owner（正是 2026-09-18 事故样本）', () => {
+  // 实况：restartStartedAtMs = 14:20:10，端口持有者 PID 29992 启动于 12:38:12 ⇒ 陈旧持有者
+  const v = decideSpawnGate({
+    recordedPid: 999, // 记录里是另一个（更陈旧的）pid
+    portOwnerPid: 29992,
+    ownerIsDshWeb: true,
+    restartStartedAtMs: 1_789_712_410_000,
+    ownerStartMs: 1_789_706_292_000,
+  })
+  assert.equal(v.decision, 'kill-port-owner')
+  assert.ok(v.reason.includes('陈旧持有者'))
+})
+
+test('decideSpawnGate：启动时刻取不到 ⇒ 朝行动一侧失败（kill-port-owner，不朝跳过）', () => {
+  const v = decideSpawnGate({ recordedPid: null, portOwnerPid: 777, ownerIsDshWeb: true, restartStartedAtMs: 1_700_000_000_000, ownerStartMs: null })
+  assert.equal(v.decision, 'kill-port-owner')
+})
+
+test('decideSpawnGate：退化输入不抛（全 null / 负数 pid / 时钟相等）', () => {
+  assert.equal(decideSpawnGate({ recordedPid: null, portOwnerPid: null, ownerIsDshWeb: false, restartStartedAtMs: 0, ownerStartMs: null }).decision, 'spawn')
+  assert.equal(decideSpawnGate({ recordedPid: null, portOwnerPid: -1, ownerIsDshWeb: true, restartStartedAtMs: 5, ownerStartMs: 5 }).decision, 'kill-port-owner') // 相等不算「晚于」⇒ 不收养
+  assert.equal(decideSpawnGate({ recordedPid: null, portOwnerPid: 1, ownerIsDshWeb: true, restartStartedAtMs: 5, ownerStartMs: 6 }).decision, 'adopt')
 })
