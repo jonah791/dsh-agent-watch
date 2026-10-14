@@ -3,8 +3,8 @@
     - id: agent-watch
       name: dsh-agent-watch
       config:
-        dshHome: C:/Users/tr/.dsh
-        watchDirs: [C:/Users/tr/.dsh]
+        dshHome: <home>/.dsh
+        watchDirs: [<home>/.dsh]
         legacyFlags: []
         bin: ''
         profile: web
@@ -14,6 +14,6 @@
         crashWindowMs: 10000
         maxQuickExits: 3
         readyTimeoutMs: 30000
-        incidentFile: C:/Users/tr/.dsh/.watch-incident.json
+        incidentFile: <home>/.dsh/.watch-incident.json
         defaultWorkspace: E:/alice
         debounceMs: 300

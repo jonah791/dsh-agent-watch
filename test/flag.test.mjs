@@ -44,7 +44,7 @@ test('serializeFlag 往返一致', () => {
 })
 
 test('workspace 含反斜杠与空格', () => {
-  const info = parseFlag(JSON.stringify({ workspace: 'C:\\Users\\tr\\Documents\\alice personal', sessionId: 's1' }))
-  assert.equal(info.workspace, 'C:\\Users\\tr\\Documents\\alice personal')
+  const info = parseFlag(JSON.stringify({ workspace: 'C:\\Users\\demo\\Documents\\alice personal', sessionId: 's1' }))
+  assert.equal(info.workspace, 'C:\\Users\\demo\\Documents\\alice personal')
   assert.equal(info.sessionId, 's1')
 })
