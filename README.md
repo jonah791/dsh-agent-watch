@@ -14,7 +14,7 @@
   <a href="https://github.com/jonah791/dsh-agent-watch"><img src="https://img.shields.io/badge/version-0.1.0-blue" alt="version"></a>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
   <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
-  <img src="https://img.shields.io/badge/tests-47%20passed-brightgreen" alt="tests">
+  <img src="https://img.shields.io/badge/tests-40%20passed-brightgreen" alt="tests">
 </p>
 
 **一句话**：DSH Web 的常驻守护——监听一个全局哨兵文件（`<DSH_HOME>/.hot-reload-flag`），触发后自动完成「预检 → 重启 web → 唤醒会话 → 清哨兵」的完整热重载周期；web 崩溃、端口空闲时也能自愈/自拉起。
